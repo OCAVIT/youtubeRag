@@ -1,0 +1,74 @@
+{
+  "description": "Примеры настройки HTTP Request нод в n8n для youtubeRag",
+  "examples": [
+    {
+      "name": "Health Check",
+      "method": "GET",
+      "url": "https://your-railway-url.up.railway.app/health",
+      "authentication": "None",
+      "body": null
+    },
+    {
+      "name": "Транскрипция видео",
+      "method": "POST",
+      "url": "https://your-railway-url.up.railway.app/transcribe",
+      "authentication": "None",
+      "bodyType": "json",
+      "body": {
+        "video_url": "{{ $json.video_url }}"
+      },
+      "description": "Транскрибирует видео в текст. Результат возвращается сразу."
+    },
+    {
+      "name": "Извлечение кадров",
+      "method": "POST",
+      "url": "https://your-railway-url.up.railway.app/extract-frames",
+      "authentication": "None",
+      "bodyType": "json",
+      "body": {
+        "video_url": "{{ $json.video_url }}",
+        "interval_sec": 5
+      },
+      "description": "Извлекает кадры каждые 5 секунд из видео."
+    },
+    {
+      "name": "Фоновая обработка видео",
+      "method": "POST",
+      "url": "https://your-railway-url.up.railway.app/process-video",
+      "authentication": "None",
+      "bodyType": "json",
+      "body": {
+        "video_url": "{{ $json.video_url }}",
+        "operations": ["transcribe", "extract_frames"]
+      },
+      "description": "Запускает обработку в фоне. Вернёт task_id для проверки статуса."
+    },
+    {
+      "name": "Проверка статуса задачи",
+      "method": "GET",
+      "url": "https://your-railway-url.up.railway.app/status/{{ $json.task_id }}",
+      "authentication": "None",
+      "body": null,
+      "description": "Проверяет статус фоновой задачи по task_id."
+    },
+    {
+      "name": "Выполнение Python кода",
+      "method": "POST",
+      "url": "https://your-railway-url.up.railway.app/exec",
+      "authentication": "None",
+      "bodyType": "json",
+      "body": {
+        "code": "print('Hello from n8n!')"
+      },
+      "description": "Выполняет произвольный Python код. ВНИМАНИЕ: используйте с осторожностью!"
+    }
+  ],
+  "n8n_workflow_tips": [
+    "1. Используйте HTTP Request ноду для всех запросов",
+    "2. Для фоновых задач: сначала POST /process-video, затем GET /status/<task_id> в цикле",
+    "3. Для обработки результатов используйте Code ноду после HTTP Request",
+    "4. Добавьте Wait ноду между запросами /process-video и /status для задержки",
+    "5. Используйте IF ноду для проверки статуса: if status === 'completed' -> обработать результат"
+  ],
+  "example_n8n_workflow_description": "1. Trigger: Webhook с video_url -> 2. HTTP Request: POST /transcribe -> 3. Code: обработать результат -> 4. HTTP Request: отправить в другой сервис"
+}

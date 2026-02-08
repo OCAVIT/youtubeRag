@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Видео и аудио файлы
+*.mp4
+*.mp3
+*.wav
+*.avi
+*.mkv
+*.flv
+*.mov
+
+# Временные файлы
+temp/*
+!temp/.gitkeep
+
+# Входные файлы
+input/*
+!input/.gitkeep
+
+# Выходные файлы
+output/*
+!output/.gitkeep
+
+# Транскрипты (можно закомментировать если нужно сохранять в git)
+transcripts/*
+!transcripts/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Docker
+.dockerignore
+
+# Environment
+.env
+.env.local
