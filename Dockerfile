@@ -7,6 +7,17 @@ RUN apt-get update && \
     ffmpeg \
     wget \
     curl \
+    pkg-config \
+    gcc \
+    g++ \
+    python3-dev \
+    libavformat-dev \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavutil-dev \
+    libswscale-dev \
+    libswresample-dev \
+    libavfilter-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Создание рабочей директории
