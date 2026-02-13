@@ -7,12 +7,15 @@ import logging
 import subprocess
 import tempfile
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
+import ffmpeg_downloader as ffdl
+
+
 
 # ====================================
 # CONFIGURATION
@@ -22,11 +25,26 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-Env vars — валидация при старте
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-API_KEY = os.environ.get("FLASK_API_KEY")
-ROOT_VIDEOS_DIR = os.environ.get("ROOT_VIDEOS_DIR", "/output/final-videos")
+# ===== ДОБАВЬ ЭТО =====
+try:
+    ffdl.add_path()
+    logger.info("[FFmpeg] ✅ Added to PATH via ffmpeg_downloader")
+except ImportError:
+    logger.warning("[FFmpeg] ffmpeg_downloader not installed, using system FFmpeg")
+except Exception as e:
+    logger.error(f"[FFmpeg] Failed to add to PATH: {e}")
+# ======================
+
+# Env vars — валидация при старте
+# SUPABASE_URL = os.environ.get("SUPABASE_URL")
+# SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+# API_KEY = os.environ.get("FLASK_API_KEY")
+# ROOT_VIDEOS_DIR = os.environ.get("ROOT_VIDEOS_DIR", "/output/final-videos")
+SUPABASE_URL = 'https://delkhtxitmpjrrzgyvyx.supabase.co'
+SUPABASE_KEY = 'sb_publishable_1_xjeffyqiUSHj72U7ypUA_BCLilePV'
+
+API_KEY = 123
+ROOT_VIDEOS_DIR = str(Path(__file__).resolve().parent / "output" / "final-videos")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -186,20 +204,36 @@ def generate_subtitles_srt(audio_path: str, output_srt_path: str) -> bool:
 
 def add_subtitles_to_video(video_path: str, srt_path: str, output_path: str) -> str:
     """Вшивает субтитры в видео (burn-in)"""
-    # Экранирование для ffmpeg subtitles filter
-    escaped_srt = srt_path.replace('\\', '/').replace(':', '\\:')
+    work_dir = os.path.dirname(os.path.abspath(video_path))
+    video_name = os.path.basename(video_path)
+    srt_name = os.path.basename(srt_path)
+    output_name = os.path.basename(output_path)
+
+    if not os.path.exists(srt_path):
+        raise FileNotFoundError(f"Subtitle file not found: {srt_path}")
+
+    logger.info(f"[Subs] Working directory: {work_dir}")
+    logger.info(f"[Subs] Using SRT: {srt_name}")
+
     subtitles_filter = (
-        f"subtitles={escaped_srt}:force_style='"
+        f"subtitles={srt_name}:force_style='"
         "FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,"
         "MarginV=50,Alignment=2'"
     )
+
     cmd = [
-        'ffmpeg', '-y', '-i', video_path,
+        'ffmpeg', '-y',
+        '-i', video_name,
         '-vf', subtitles_filter,
-        '-c:a', 'copy', output_path
+        '-c:a', 'copy', output_name
     ]
-    run_ffmpeg(cmd, "Subtitles")
+
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=work_dir)
+    if result.returncode != 0:
+        logger.error(f"[Subtitles] FFmpeg stderr:\n{result.stderr}")
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+
     logger.info(f"[Subs] ✅ {output_path}")
     return output_path
 
@@ -262,7 +296,7 @@ def render_chapter_task(chapter_id: str):
     try:
         supabase.table("chapters").update({
             "status": "rendering",
-            "updated_at": datetime.utcnow().isoformat()
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", chapter_id).execute()
     except Exception as e:
         logger.error(f"[DB] Failed to set rendering status: {e}")
@@ -273,12 +307,13 @@ def render_chapter_task(chapter_id: str):
     if not acquired:
         logger.error("[RENDER] Semaphore timeout — too many concurrent renders")
         supabase.table("chapters").update({
-            "status": "failed", "updated_at": datetime.utcnow().isoformat()
+            "status": "failed", "updated_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", chapter_id).execute()
         return
 
     # Пути
-    project_dir = Path(ROOT_VIDEOS_DIR) / f"project_{project_id}"
+    root_dir = Path(ROOT_VIDEOS_DIR).resolve()
+    project_dir = root_dir / f"project_{project_id}"
     chapter_dir = project_dir / f"chapter_{chapter_number}"
     temp_dir = chapter_dir / "temp_scripts"
 
@@ -324,27 +359,32 @@ def render_chapter_task(chapter_id: str):
             block_dir.mkdir(parents=True, exist_ok=True)
 
             # ── Скачиваем файлы ──
-            audio_path = str(block_dir / "audio.wav")
-            image_path = str(block_dir / "image.png")
+            audio_path = str((block_dir / "audio.wav").resolve())
+            image_path = str((block_dir / "image.png").resolve())
 
             download_file(audio_url, audio_path)
             download_file(image_url, image_path)
+
+            logger.info(f"[Block {seq}] Audio exists: {os.path.exists(audio_path)}")
+            logger.info(f"[Block {seq}] Image exists: {os.path.exists(image_path)}")
+            logger.info(f"[Block {seq}] Audio path: {audio_path}")
+            logger.info(f"[Block {seq}] Image path: {image_path}")
 
             # ── Определяем длительность аудио ──
             duration = get_audio_duration(audio_path)
             logger.info(f"[Block {seq}] Audio duration: {duration:.1f}s")
 
             # ── Создаём видео (картинка + аудио) ──
-            raw_video = str(block_dir / "raw.mp4")
+            raw_video = str((block_dir / "raw.mp4").resolve())
             create_looped_video_with_audio(image_path, audio_path, raw_video, duration)
 
             # ── Субтитры через Whisper ──
-            srt_path = str(block_dir / "subs.srt")
+            srt_path = str((block_dir / "subs.srt").resolve())
             subs_ok = generate_subtitles_srt(audio_path, srt_path)
 
             # ── Вшиваем субтитры (или берём без них) ──
             if subs_ok and os.path.exists(srt_path):
-                final_block_video = str(block_dir / "final.mp4")
+                final_block_video = str((block_dir / "final.mp4").resolve())
                 add_subtitles_to_video(raw_video, srt_path, final_block_video)
                 processed_videos.append(final_block_video)
             else:
@@ -370,7 +410,7 @@ def render_chapter_task(chapter_id: str):
         supabase.table("chapters").update({
             "status": "rendered",
             "video_url": final_path,
-            "updated_at": datetime.utcnow().isoformat()
+            "updated_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", chapter_id).execute()
 
         logger.info(f"\n{'='*60}")
@@ -381,7 +421,7 @@ def render_chapter_task(chapter_id: str):
         logger.error(f"[RENDER] ❌ ERROR: {e}", exc_info=True)
         try:
             supabase.table("chapters").update({
-                "status": "failed", "updated_at": datetime.utcnow().isoformat()
+                "status": "failed", "updated_at": datetime.now(timezone.utc).isoformat()
             }).eq("id", chapter_id).execute()
         except Exception:
             logger.error("[DB] Failed to update status to 'failed'", exc_info=True)
@@ -452,10 +492,9 @@ def render_chapter():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "healthy1"}), 200
+    return jsonify({"status": "healthy"}), 200
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5055))
-    logger.info(f"Запуск Flask dev-сервера на порту {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5055))
+    app.run(host='0.0.0.0', port=port, debug=False)
