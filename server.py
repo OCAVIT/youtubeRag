@@ -13,9 +13,6 @@ from pathlib import Path
 import requests
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
-import ffmpeg_downloader as ffdl
-
-
 
 # ====================================
 # CONFIGURATION
@@ -25,26 +22,11 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===== ДОБАВЬ ЭТО =====
-try:
-    ffdl.add_path()
-    logger.info("[FFmpeg] ✅ Added to PATH via ffmpeg_downloader")
-except ImportError:
-    logger.warning("[FFmpeg] ffmpeg_downloader not installed, using system FFmpeg")
-except Exception as e:
-    logger.error(f"[FFmpeg] Failed to add to PATH: {e}")
-# ======================
-
 # Env vars — валидация при старте
-# SUPABASE_URL = os.environ.get("SUPABASE_URL")
-# SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
-# API_KEY = os.environ.get("FLASK_API_KEY")
-# ROOT_VIDEOS_DIR = os.environ.get("ROOT_VIDEOS_DIR", "/output/final-videos")
-SUPABASE_URL = 'https://delkhtxitmpjrrzgyvyx.supabase.co'
-SUPABASE_KEY = 'sb_publishable_1_xjeffyqiUSHj72U7ypUA_BCLilePV'
-
-API_KEY = 123
-ROOT_VIDEOS_DIR = str(Path(__file__).resolve().parent / "output" / "final-videos")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+API_KEY = os.environ.get("FLASK_API_KEY")
+ROOT_VIDEOS_DIR = os.environ.get("ROOT_VIDEOS_DIR", "/output/final-videos")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
