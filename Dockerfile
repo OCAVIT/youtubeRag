@@ -18,13 +18,15 @@ RUN apt-get update && \
     libavfilter-dev \
     && rm -rf /var/lib/apt/lists/*
 
+RUN find /usr/share/fonts -name "DejaVuSans.ttf"
+
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN mkdir -p input output temp transcripts
+RUN mkdir -p input output/final-videos temp transcripts
 
 EXPOSE ${PORT:-5055}
 
