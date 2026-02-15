@@ -8,3 +8,4 @@ pillow==11.1.0
 yt-dlp==2026.2.4
 supabase>=2.3.0
 postgrest>=0.16.0
+yadisk==3.4.0
