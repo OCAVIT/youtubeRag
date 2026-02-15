@@ -302,7 +302,10 @@ def generate_subtitles_srt(audio_path: str, output_srt_path: str) -> bool:
 
 
 def add_subtitles_to_video(video_path: str, srt_path: str, output_path: str) -> str:
-    """Вшивает субтитры в видео (burn-in)"""
+    """Вшивает субтитры в видео (burn-in).
+    Использует фильтр 'subtitles' (libass). Если libass недоступен —
+    парсит SRT и вшивает через 'drawtext' (всегда встроен в FFmpeg).
+    """
     video_abs = os.path.abspath(video_path)
     srt_abs = os.path.abspath(srt_path)
     output_abs = os.path.abspath(output_path)
@@ -310,33 +313,141 @@ def add_subtitles_to_video(video_path: str, srt_path: str, output_path: str) -> 
     if not os.path.exists(srt_abs):
         raise FileNotFoundError(f"Subtitle file not found: {srt_abs}")
 
-    # FFmpeg subtitles filter (libass) требует экранирования
-    # спецсимволов в пути: \ → / и : → \:
-    srt_escaped = srt_abs.replace('\\', '/').replace(':', '\\:')
-
     logger.info(f"[Subs] Video: {video_abs}")
-    logger.info(f"[Subs] SRT (escaped): {srt_escaped}")
+    logger.info(f"[Subs] SRT: {srt_abs}")
 
-    subtitles_filter = (
-        f"subtitles={srt_escaped}:force_style='"
-        "FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,"
-        "MarginV=50,Alignment=2'"
-    )
+    # ── Сначала пробуем libass (subtitles filter) ──
+    if _has_libass_support():
+        # FFmpeg subtitles filter (libass) требует экранирования
+        # спецсимволов в пути: \ → /, : → \:, ' → \'
+        srt_escaped = srt_abs.replace('\\', '/').replace(':', '\\:').replace("'", "\\'")
+
+        subtitles_filter = (
+            f"subtitles='{srt_escaped}':force_style='"
+            "FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,"
+            "MarginV=50,Alignment=2'"
+        )
+
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', video_abs,
+            '-vf', subtitles_filter,
+            '-c:a', 'copy', output_abs
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            logger.info(f"[Subs] ✅ {output_abs} (libass)")
+            return output_path
+        else:
+            logger.warning(f"[Subs] libass subtitles filter failed (code {result.returncode}), falling back to drawtext")
+            logger.warning(f"[Subs] FFmpeg stderr: {result.stderr[-500:]}")
+
+    # ── Fallback: drawtext (всегда доступен) ──
+    logger.info("[Subs] Using drawtext fallback")
+    return _burn_subs_drawtext(video_abs, srt_abs, output_abs)
+
+
+# Кеш проверки libass
+_libass_available: bool | None = None
+
+
+def _has_libass_support() -> bool:
+    """Проверяет, поддерживает ли FFmpeg фильтр subtitles (libass)"""
+    global _libass_available
+    if _libass_available is not None:
+        return _libass_available
+
+    try:
+        result = subprocess.run(
+            ['ffmpeg', '-filters'],
+            capture_output=True, text=True, timeout=10
+        )
+        _libass_available = 'subtitles' in result.stdout
+        if not _libass_available:
+            logger.warning("[Subs] FFmpeg compiled WITHOUT libass — subtitles filter unavailable")
+        else:
+            logger.info("[Subs] FFmpeg libass support: ✅")
+    except Exception:
+        _libass_available = False
+
+    return _libass_available
+
+
+def _parse_srt(srt_path: str) -> list[dict]:
+    """Парсит SRT-файл → список {start, end, text}"""
+    entries = []
+    with open(srt_path, 'r', encoding='utf-8') as f:
+        content = f.read().strip()
+
+    blocks = re.split(r'\n\s*\n', content)
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) < 3:
+            continue
+        time_match = re.match(
+            r'(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})',
+            lines[1]
+        )
+        if not time_match:
+            continue
+        g = time_match.groups()
+        start = int(g[0]) * 3600 + int(g[1]) * 60 + int(g[2]) + int(g[3]) / 1000
+        end = int(g[4]) * 3600 + int(g[5]) * 60 + int(g[6]) + int(g[7]) / 1000
+        text = ' '.join(lines[2:]).strip()
+        entries.append({"start": start, "end": end, "text": text})
+
+    return entries
+
+
+def _burn_subs_drawtext(video_path: str, srt_path: str, output_path: str) -> str:
+    """Вшивает субтитры через drawtext фильтры (не требует libass)"""
+    entries = _parse_srt(srt_path)
+    if not entries:
+        logger.warning("[Subs] No subtitle entries found — copying video without subs")
+        shutil.copy2(video_path, output_path)
+        return output_path
+
+    # Формируем drawtext-фильтры для каждой строки субтитров
+    drawtext_parts = []
+    for entry in entries:
+        # Экранируем текст для FFmpeg drawtext: ' → '', : → \:, \ → \\
+        text = entry['text']
+        text = text.replace("\\", "\\\\")
+        text = text.replace("'", "'\\''")
+        text = text.replace(":", "\\:")
+        text = text.replace("%", "%%")
+
+        dt = (
+            f"drawtext=text='{text}'"
+            f":enable='between(t,{entry['start']:.3f},{entry['end']:.3f})'"
+            f":fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            f":fontsize=24:fontcolor=white"
+            f":borderw=2:bordercolor=black"
+            f":x=(w-text_w)/2:y=h-th-50"
+        )
+        drawtext_parts.append(dt)
+
+    # FFmpeg -vf поддерживает цепочку фильтров через ","
+    vf = ",".join(drawtext_parts)
 
     cmd = [
         'ffmpeg', '-y',
-        '-i', video_abs,
-        '-vf', subtitles_filter,
-        '-c:a', 'copy', output_abs
+        '-i', video_path,
+        '-vf', vf,
+        '-c:a', 'copy', output_path
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        logger.error(f"[Subtitles] FFmpeg stderr:\n{result.stderr}")
-        raise subprocess.CalledProcessError(result.returncode, cmd)
+        logger.error(f"[Subs/drawtext] FFmpeg stderr:\n{result.stderr[-1000:]}")
+        # Последний fallback — копируем видео без субтитров
+        logger.warning("[Subs] drawtext also failed — using video without subtitles")
+        shutil.copy2(video_path, output_path)
+        return output_path
 
-    logger.info(f"[Subs] ✅ {output_abs}")
+    logger.info(f"[Subs] ✅ {output_path} (drawtext)")
     return output_path
 
 
