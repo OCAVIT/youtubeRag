@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import uuid
 import shutil
 import threading
 import logging
@@ -11,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+import yadisk
 from flask import Flask, request, jsonify
 from supabase import create_client, Client
 
@@ -27,6 +29,9 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 API_KEY = os.environ.get("FLASK_API_KEY")
 ROOT_VIDEOS_DIR = os.environ.get("ROOT_VIDEOS_DIR", "/output/final-videos")
+# Яндекс.Диск
+YANDEX_DISK_TOKEN = os.environ.get("YANDEX_DISK_TOKEN")
+YANDEX_DISK_ROOT_FOLDER = "/YouTubeRAG"
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -48,6 +53,118 @@ def get_whisper_model():
                 _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
                 logger.info("[Whisper] ✅ Model loaded")
     return _whisper_model
+
+
+# ====================================
+# YANDEX DISK MANAGER
+# ====================================
+
+class YandexDiskManager:
+    """Менеджер для загрузки финальных видео на Яндекс.Диск"""
+
+    def __init__(self, token: str):
+        self.client = yadisk.YaDisk(token=token)
+        self.root_folder = YANDEX_DISK_ROOT_FOLDER
+
+    def check_connection(self) -> bool:
+        """Проверка валидности токена"""
+        try:
+            return self.client.check_token()
+        except Exception as e:
+            logger.error(f"[YaDisk] Token check failed: {e}")
+            return False
+
+    def _ensure_folder(self, remote_path: str):
+        """Рекурсивно создаёт папки на Яндекс.Диске если не существуют"""
+        parts = remote_path.strip("/").split("/")
+        current = ""
+        for part in parts:
+            current += f"/{part}"
+            try:
+                if not self.client.exists(current):
+                    self.client.mkdir(current)
+                    logger.info(f"[YaDisk] Created folder: {current}")
+            except Exception as e:
+                logger.error(f"[YaDisk] Failed to create folder {current}: {e}")
+                raise
+
+    def upload_file(self, local_path: str, remote_relative_path: str) -> tuple[bool, str]:
+        """
+        Загружает файл на Яндекс.Диск.
+
+        Args:
+            local_path: Абсолютный путь к локальному файлу
+            remote_relative_path: Относительный путь внутри root_folder
+                (например: project_xxx/chapter_1.mp4)
+
+        Returns:
+            (success, public_url_or_error)
+        """
+        remote_path = f"{self.root_folder}/{remote_relative_path}"
+        remote_dir = "/".join(remote_path.split("/")[:-1])
+
+        try:
+            # Создаём структуру папок
+            self._ensure_folder(remote_dir)
+
+            # Загружаем файл
+            logger.info(f"[YaDisk] Uploading {local_path} → {remote_path}")
+            self.client.upload(local_path, remote_path, overwrite=True)
+            logger.info(f"[YaDisk] ✅ Upload complete: {remote_path}")
+
+            # Публикуем и получаем ссылку
+            self.client.publish(remote_path)
+            meta = self.client.get_meta(remote_path)
+            public_url = meta.public_url or ""
+
+            logger.info(f"[YaDisk] ✅ Public URL: {public_url}")
+            return True, public_url
+
+        except Exception as e:
+            logger.error(f"[YaDisk] ❌ Upload failed: {e}", exc_info=True)
+            return False, str(e)
+
+
+# ====================================
+# JOB TRACKING
+# ====================================
+
+_jobs: dict[str, dict] = {}  # job_id → job info
+_jobs_lock = threading.Lock()
+
+
+def create_job(chapter_id: str) -> str:
+    """Создаёт новую задачу рендера, возвращает job_id"""
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "chapter_id": chapter_id,
+            "status": "queued",
+            "stage": "Waiting in queue",
+            "completed": False,
+            "video_url": None,
+            "error": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    logger.info(f"[Job] Created job {job_id} for chapter {chapter_id}")
+    return job_id
+
+
+def update_job(job_id: str, **kwargs):
+    """Обновляет поля задачи"""
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(kwargs)
+            _jobs[job_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def get_job(job_id: str) -> dict | None:
+    """Возвращает копию данных задачи"""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return dict(job) if job else None
 
 
 # ====================================
@@ -186,19 +303,22 @@ def generate_subtitles_srt(audio_path: str, output_srt_path: str) -> bool:
 
 def add_subtitles_to_video(video_path: str, srt_path: str, output_path: str) -> str:
     """Вшивает субтитры в видео (burn-in)"""
-    work_dir = os.path.dirname(os.path.abspath(video_path))
-    video_name = os.path.basename(video_path)
-    srt_name = os.path.basename(srt_path)
-    output_name = os.path.basename(output_path)
+    video_abs = os.path.abspath(video_path)
+    srt_abs = os.path.abspath(srt_path)
+    output_abs = os.path.abspath(output_path)
 
-    if not os.path.exists(srt_path):
-        raise FileNotFoundError(f"Subtitle file not found: {srt_path}")
+    if not os.path.exists(srt_abs):
+        raise FileNotFoundError(f"Subtitle file not found: {srt_abs}")
 
-    logger.info(f"[Subs] Working directory: {work_dir}")
-    logger.info(f"[Subs] Using SRT: {srt_name}")
+    # FFmpeg subtitles filter (libass) требует экранирования
+    # спецсимволов в пути: \ → / и : → \:
+    srt_escaped = srt_abs.replace('\\', '/').replace(':', '\\:')
+
+    logger.info(f"[Subs] Video: {video_abs}")
+    logger.info(f"[Subs] SRT (escaped): {srt_escaped}")
 
     subtitles_filter = (
-        f"subtitles={srt_name}:force_style='"
+        f"subtitles={srt_escaped}:force_style='"
         "FontName=Arial,FontSize=24,PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,"
         "MarginV=50,Alignment=2'"
@@ -206,17 +326,17 @@ def add_subtitles_to_video(video_path: str, srt_path: str, output_path: str) -> 
 
     cmd = [
         'ffmpeg', '-y',
-        '-i', video_name,
+        '-i', video_abs,
         '-vf', subtitles_filter,
-        '-c:a', 'copy', output_name
+        '-c:a', 'copy', output_abs
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=work_dir)
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         logger.error(f"[Subtitles] FFmpeg stderr:\n{result.stderr}")
         raise subprocess.CalledProcessError(result.returncode, cmd)
 
-    logger.info(f"[Subs] ✅ {output_path}")
+    logger.info(f"[Subs] ✅ {output_abs}")
     return output_path
 
 
@@ -245,17 +365,21 @@ def concatenate_videos(video_paths: list[str], output_path: str) -> str:
 # MAIN RENDER FUNCTION
 # ====================================
 
-def render_chapter_task(chapter_id: str):
+def render_chapter_task(chapter_id: str, job_id: str):
     """
     Фоновая задача: рендер одной главы.
     1. Берёт данные главы и её script_blocks из Supabase
     2. Для каждого блока: скачивает картинку+аудио → видео → субтитры
     3. Склеивает все блоки в один chapter_{number}.mp4
+    4. Загружает финальное видео на Яндекс.Диск
+    5. Удаляет локальный финальный файл после успешной загрузки
     """
 
     logger.info(f"\n{'='*60}")
-    logger.info(f"[RENDER] Starting chapter {chapter_id}")
+    logger.info(f"[RENDER] Starting chapter {chapter_id} (job {job_id})")
     logger.info(f"{'='*60}\n")
+
+    update_job(job_id, status="in_progress", stage="Fetching chapter data")
 
     # ── Получаем данные главы ──
     try:
@@ -267,6 +391,7 @@ def render_chapter_task(chapter_id: str):
         chapter = chapter_resp.data
     except Exception as e:
         logger.error(f"[DB] Failed to fetch chapter: {e}")
+        update_job(job_id, status="failed", stage="Failed to fetch chapter data", error=str(e))
         return
 
     project_id = chapter['project_id']
@@ -282,15 +407,18 @@ def render_chapter_task(chapter_id: str):
         }).eq("id", chapter_id).execute()
     except Exception as e:
         logger.error(f"[DB] Failed to set rendering status: {e}")
+        update_job(job_id, status="failed", stage="Failed to update DB status", error=str(e))
         return
 
     # ── Семафор ──
+    update_job(job_id, stage="Waiting for render slot")
     acquired = render_semaphore.acquire(timeout=300)
     if not acquired:
         logger.error("[RENDER] Semaphore timeout — too many concurrent renders")
         supabase.table("chapters").update({
             "status": "failed", "updated_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", chapter_id).execute()
+        update_job(job_id, status="failed", stage="Semaphore timeout", error="Too many concurrent renders")
         return
 
     # Пути
@@ -304,6 +432,7 @@ def render_chapter_task(chapter_id: str):
         # STEP 1: Загрузка script_blocks из Supabase
         # ========================================
 
+        update_job(job_id, status="rendering", stage="Fetching script blocks")
         logger.info("[DB] Fetching script_blocks...")
         resp = supabase.table("script_blocks") \
             .select("*") \
@@ -316,6 +445,7 @@ def render_chapter_task(chapter_id: str):
             raise ValueError(f"No script_blocks for chapter {chapter_id}")
 
         logger.info(f"[DB] ✅ Loaded {len(blocks)} blocks")
+        total_blocks = len(blocks)
 
         # ========================================
         # STEP 2: Обработка каждого блока
@@ -327,6 +457,7 @@ def render_chapter_task(chapter_id: str):
             seq = block['sequence_number']
             assets = parse_json_field(block.get('assets'))
 
+            update_job(job_id, stage=f"Rendering block {seq}/{total_blocks}")
             logger.info(f"\n[Block {seq}] Processing...")
 
             audio_url = assets.get('audio_url')
@@ -361,6 +492,7 @@ def render_chapter_task(chapter_id: str):
             create_looped_video_with_audio(image_path, audio_path, raw_video, duration)
 
             # ── Субтитры через Whisper ──
+            update_job(job_id, stage=f"Generating subtitles for block {seq}/{total_blocks}")
             srt_path = str((block_dir / "subs.srt").resolve())
             subs_ok = generate_subtitles_srt(audio_path, srt_path)
 
@@ -381,26 +513,74 @@ def render_chapter_task(chapter_id: str):
         # STEP 3: Склейка всех блоков в главу
         # ========================================
 
+        update_job(job_id, stage="Concatenating blocks into final video")
         final_path = str(project_dir / f"chapter_{chapter_number}.mp4")
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
         concatenate_videos(processed_videos, final_path)
 
         # ========================================
-        # STEP 4: Обновление статуса
+        # STEP 4: Загрузка на Яндекс.Диск
         # ========================================
 
-        supabase.table("chapters").update({
+        update_job(job_id, status="uploading", stage="Uploading to Yandex.Disk")
+        logger.info("[RENDER] Uploading final video to Yandex.Disk...")
+
+        yadisk_url = None
+
+        if not YANDEX_DISK_TOKEN:
+            logger.error("[YaDisk] YANDEX_DISK_TOKEN not set — skipping upload")
+            update_job(job_id, stage="Yandex.Disk upload skipped (no token)")
+        else:
+            yadisk_manager = YandexDiskManager(YANDEX_DISK_TOKEN)
+
+            if not yadisk_manager.check_connection():
+                logger.error("[YaDisk] Connection check failed")
+                update_job(job_id, stage="Yandex.Disk connection failed")
+            else:
+                # Относительный путь: project_{id}/chapter_{n}.mp4
+                remote_relative = f"project_{project_id}/chapter_{chapter_number}.mp4"
+                upload_ok, upload_result = yadisk_manager.upload_file(final_path, remote_relative)
+
+                if upload_ok:
+                    yadisk_url = upload_result
+                    logger.info(f"[YaDisk] ✅ Uploaded → {yadisk_url}")
+
+                    # Удаляем локальный финальный файл после успешной загрузки
+                    try:
+                        os.remove(final_path)
+                        logger.info(f"[Cleanup] ✅ Removed local final: {final_path}")
+                    except Exception as e:
+                        logger.warning(f"[Cleanup] Failed to remove local final: {e}")
+                else:
+                    logger.error(f"[YaDisk] ❌ Upload failed: {upload_result}")
+                    update_job(job_id, stage=f"Yandex.Disk upload failed: {upload_result}")
+
+        # ========================================
+        # STEP 5: Обновление статуса
+        # ========================================
+
+        chapter_update = {
             "status": "rendered",
-            "video_url": final_path,
+            "video_url": yadisk_url or final_path,
             "updated_at": datetime.now(timezone.utc).isoformat()
-        }).eq("id", chapter_id).execute()
+        }
+        supabase.table("chapters").update(chapter_update).eq("id", chapter_id).execute()
+
+        update_job(
+            job_id,
+            status="completed",
+            stage="Done",
+            completed=True,
+            video_url=yadisk_url or final_path,
+        )
 
         logger.info(f"\n{'='*60}")
-        logger.info(f"[RENDER] ✅ SUCCESS! → {final_path}")
+        logger.info(f"[RENDER] ✅ SUCCESS! → {yadisk_url or final_path}")
         logger.info(f"{'='*60}\n")
 
     except Exception as e:
         logger.error(f"[RENDER] ❌ ERROR: {e}", exc_info=True)
+        update_job(job_id, status="failed", stage="Render failed", error=str(e))
         try:
             supabase.table("chapters").update({
                 "status": "failed", "updated_at": datetime.now(timezone.utc).isoformat()
@@ -441,6 +621,8 @@ def render_chapter():
     n8n шлёт POST с chapter_id.
 
     Body: { "chapter_id": "uuid" }
+
+    Response 202: { status, message, chapter_id, job_id }
     """
     try:
         data = request.get_json(silent=True)
@@ -451,25 +633,54 @@ def render_chapter():
         if not chapter_id:
             return jsonify({"error": "Missing chapter_id"}), 400
 
+        # Создаём уникальный ID задачи
+        job_id = create_job(chapter_id)
+
         # Фоновый рендер
         thread = threading.Thread(
             target=render_chapter_task,
-            args=(chapter_id,),
+            args=(chapter_id, job_id),
             daemon=True
         )
         thread.start()
 
-        logger.info(f"[API] Render started for chapter {chapter_id}")
+        logger.info(f"[API] Render started for chapter {chapter_id}, job {job_id}")
 
         return jsonify({
             "status": "accepted",
             "message": "Render task started",
-            "chapter_id": chapter_id
+            "chapter_id": chapter_id,
+            "job_id": job_id,
         }), 202
 
     except Exception as e:
         logger.error(f"[API] Error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/job-status/<job_id>', methods=['GET'])
+@require_api_key
+def job_status(job_id: str):
+    """
+    Возвращает текущий статус задачи рендера по job_id.
+
+    Response 200:
+    {
+        "job_id": "uuid",
+        "chapter_id": "uuid",
+        "status": "queued|in_progress|rendering|uploading|completed|failed",
+        "stage": "Human-readable current stage",
+        "completed": true/false,
+        "video_url": "https://... (Yandex.Disk public link)" | null,
+        "error": "..." | null,
+        "created_at": "...",
+        "updated_at": "..."
+    }
+    """
+    job = get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job), 200
 
 
 @app.route('/health', methods=['GET'])
