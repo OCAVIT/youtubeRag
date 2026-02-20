@@ -178,51 +178,46 @@ def parse_json_field(value):
     return value or {}
 
 
-def extract_gdrive_file_id(url: str):
-    """Извлекает file_id из Google Drive URL. Возвращает None если не GDrive."""
-    # https://drive.google.com/file/d/FILE_ID/view?usp=sharing
-    # https://drive.google.com/open?id=FILE_ID
-    match = re.search(r'/d/([a-zA-Z0-9_-]+)', url)
-    if match:
-        return match.group(1)
-    match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', url)
-    if match:
-        return match.group(1)
-    return None
+def is_yadisk_public_link(url: str) -> bool:
+    """Проверяет, является ли URL публичной ссылкой Яндекс.Диска."""
+    return bool(re.search(r'(yadi\.sk|disk\.yandex\.(ru|com))', url))
+
+
+def get_yadisk_download_url(public_url: str) -> str:
+    """Получает прямую ссылку на скачивание из публичной ссылки Яндекс.Диска.
+
+    Использует REST API: GET /v1/disk/public/resources/download?public_key=...
+    Возвращает прямой URL для скачивания.
+    """
+    api_url = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
+    resp = requests.get(api_url, params={"public_key": public_url}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    href = data.get("href")
+    if not href:
+        raise ValueError(f"Yandex.Disk API did not return download href for {public_url}")
+    return href
 
 
 def download_file(url: str, save_path: str) -> str:
-    """Скачивает файл. Поддерживает Google Drive и обычные URL."""
+    """Скачивает файл. Поддерживает Яндекс.Диск публичные ссылки и обычные URL."""
     logger.info(f"[Download] {url}")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    gdrive_id = extract_gdrive_file_id(url)
-
-    if gdrive_id:
-        # Google Drive — прямая скачка + обработка подтверждения для больших файлов
-        download_url = f"https://drive.google.com/uc?export=download&id={gdrive_id}"
-        session = requests.Session()
-        resp = session.get(download_url, stream=True, timeout=60)
+    if is_yadisk_public_link(url):
+        # Яндекс.Диск — получаем прямую ссылку через API
+        logger.info(f"[Download] Detected Yandex.Disk public link")
+        direct_url = get_yadisk_download_url(url)
+        resp = requests.get(direct_url, stream=True, timeout=120)
         resp.raise_for_status()
-
-        # Если Google просит подтверждение (большой файл) — достаём confirm token
-        if 'text/html' in resp.headers.get('Content-Type', ''):
-            confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', resp.text)
-            if confirm_match:
-                download_url += f"&confirm={confirm_match.group(1)}"
-                resp = session.get(download_url, stream=True, timeout=60)
-                resp.raise_for_status()
-
-        with open(save_path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
     else:
         # Обычный URL (unsplash, S3, и т.д.)
         resp = requests.get(url, stream=True, timeout=60)
         resp.raise_for_status()
-        with open(save_path, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
+
+    with open(save_path, 'wb') as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
 
     file_size = os.path.getsize(save_path)
     logger.info(f"[Download] ✅ Saved {save_path} ({file_size} bytes)")
